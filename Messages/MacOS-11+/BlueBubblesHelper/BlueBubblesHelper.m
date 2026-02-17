@@ -743,36 +743,291 @@ NSMutableArray* vettedAliases;
     // If the server tells us to get findmy friends locations
     } else if ([event isEqualToString:@"refresh-findmy-friends"]) {
         if ([[NSProcessInfo processInfo] operatingSystemVersion].majorVersion > 13) {
-            FindMyLocateSession *session = [[IMFMFSession sharedInstance] fmlSession];
-            DLog("BLUEBUBBLESHELPER: block 1: %@", [session locationUpdateCallback]);
-            //            [self logString:[[[[CTBlockDescription alloc] initWithBlock:[session locationUpdateCallback]] blockSignature] debugDescription]];
-            //            NSObject *block = ^(FMLLocation *test, FMLHandle *test2) {
-            //                DLog("BLUEBUBBLESHELPER: test2: %@", test);
-            //                DLog("BLUEBUBBLESHELPER: test2: %@", [test className]);
-            //            };
-            //            DLog("BLUEBUBBLESHELPER: setting block: %@", block);
-            //            DLog("BLUEBUBBLESHELPER: setting block: %@", [[[[CTBlockDescription alloc] initWithBlock:block] blockSignature] debugDescription]);
-            //            [session setLocationUpdateCallback:block];
-            //            DLog("BLUEBUBBLESHELPER: block 2: %@", [session locationUpdateCallback]);
-            //            DLog("BLUEBUBBLESHELPER: block 2: %@", [[[[CTBlockDescription alloc] initWithBlock:[session locationUpdateCallback]] blockSignature] debugDescription]);
-            [session getFriendsSharingLocationsWithMeWithCompletion:^(NSArray *friends) {
-                for (NSObject* friend in friends) {
-                    NSObject* handle = [friend performSelector:(NSSelectorFromString(@"handle"))];
-                    DLog("BLUEBUBBLESHELPER: test: %@", handle);
-                    [session startRefreshingLocationForHandles:@[handle] priority:(1000) isFromGroup:FALSE reverseGeocode:TRUE completion:^() {
-                        NSObject *test = [session cachedLocationForHandle:handle includeAddress:TRUE];
-                        DLog("BLUEBUBBLESHELPER: test: %@", test);
-                        DLog("BLUEBUBBLESHELPER: test: %@", [test className]);
+            @try {
+                FindMyLocateSession *session = [[IMFMFSession sharedInstance] fmlSession];
+                if (session == nil) {
+                    DLog("BLUEBUBBLESHELPER: FindMyLocateSession is nil, cannot fetch friend locations");
+                    if (transaction != nil) {
+                        [[NetworkController sharedInstance] sendMessage: @{
+                            @"transactionId": transaction,
+                            @"locations": @[],
+                            @"error": @"FindMyLocateSession is not available"
+                        }];
+                    }
+                    return;
+                }
+
+                // Capture transaction for use in async blocks
+                NSString *txn = transaction;
+
+                [session getFriendsSharingLocationsWithMeWithCompletion:^(NSArray *friends) {
+                    @try {
+                        if (friends == nil || [friends count] == 0) {
+                            DLog("BLUEBUBBLESHELPER: No friends sharing locations with me");
+                            if (txn != nil) {
+                                [[NetworkController sharedInstance] sendMessage: @{
+                                    @"transactionId": txn,
+                                    @"locations": @[],
+                                }];
+                            }
+                            return;
+                        }
+
+                        DLog("BLUEBUBBLESHELPER: Found %lu friends sharing locations", (unsigned long)[friends count]);
+
+                        // Collect all handles from friends
+                        NSMutableArray *allHandles = [[NSMutableArray alloc] init];
+                        for (NSObject *friendObj in friends) {
+                            @try {
+                                if ([friendObj respondsToSelector:NSSelectorFromString(@"handle")]) {
+                                    NSObject *handle = [friendObj performSelector:NSSelectorFromString(@"handle")];
+                                    if (handle != nil) {
+                                        [allHandles addObject:handle];
+                                        DLog("BLUEBUBBLESHELPER: Found friend handle: %@", handle);
+                                    }
+                                }
+                            } @catch (NSException *e) {
+                                DLog("BLUEBUBBLESHELPER: Error getting handle from friend: %@", e);
+                            }
+                        }
+
+                        if ([allHandles count] == 0) {
+                            DLog("BLUEBUBBLESHELPER: No valid handles found");
+                            if (txn != nil) {
+                                [[NetworkController sharedInstance] sendMessage: @{
+                                    @"transactionId": txn,
+                                    @"locations": @[],
+                                }];
+                            }
+                            return;
+                        }
+
+                        // Use a mutable array to collect results, protected by a lock
+                        NSMutableArray *locations = [[NSMutableArray alloc] init];
+                        NSLock *locationsLock = [[NSLock alloc] init];
+                        NSUInteger totalHandles = [allHandles count];
+
+                        // Save the original callback so we can restore it later
+                        id originalCallback = [session locationUpdateCallback];
+
+                        // Track which handles have reported back
+                        NSMutableSet *completedHandles = [[NSMutableSet alloc] init];
+                        NSLock *completedLock = [[NSLock alloc] init];
+
+                        // Set up a timeout to send whatever we have after 15 seconds
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                            @try {
+                                [completedLock lock];
+                                NSUInteger completed = [completedHandles count];
+                                [completedLock unlock];
+
+                                // Only send if not all handles have completed yet (i.e. we timed out)
+                                if (completed < totalHandles) {
+                                    DLog("BLUEBUBBLESHELPER: FindMy location refresh timed out. Got %lu/%lu locations", (unsigned long)completed, (unsigned long)totalHandles);
+
+                                    // Restore original callback
+                                    [session setLocationUpdateCallback:originalCallback];
+
+                                    [locationsLock lock];
+                                    NSArray *locationsCopy = [locations copy];
+                                    [locationsLock unlock];
+
+                                    if (txn != nil) {
+                                        [[NetworkController sharedInstance] sendMessage: @{
+                                            @"transactionId": txn,
+                                            @"locations": locationsCopy,
+                                        }];
+                                    }
+                                }
+                            } @catch (NSException *e) {
+                                DLog("BLUEBUBBLESHELPER: Error in timeout handler: %@", e);
+                            }
+                        });
+
+                        // Set the locationUpdateCallback to capture location updates
+                        [session setLocationUpdateCallback:^(FMLLocation *location, FMLHandle *handle) {
+                            @try {
+                                if (location == nil || handle == nil) {
+                                    DLog("BLUEBUBBLESHELPER: locationUpdateCallback fired with nil location or handle");
+                                    return;
+                                }
+
+                                NSString *handleId = [handle identifier];
+                                DLog("BLUEBUBBLESHELPER: Got location update for handle: %@", handleId);
+
+                                // Build location dictionary matching the macOS <=13 format
+                                NSString *longAddress = nil;
+                                NSString *shortAddress = nil;
+                                NSString *title = nil;
+                                NSString *subtitle = nil;
+
+                                // FMLLocation uses address (NSObject) and coarseAddressLabel (NSString)
+                                if ([location respondsToSelector:@selector(address)] && [location address] != nil) {
+                                    longAddress = [[location address] description];
+                                }
+                                if ([location respondsToSelector:@selector(coarseAddressLabel)] && [location coarseAddressLabel] != nil) {
+                                    shortAddress = [location coarseAddressLabel];
+                                }
+                                // Use labels array for title/subtitle if available
+                                if ([location respondsToSelector:@selector(labels)] && [location labels] != nil && [[location labels] count] > 0) {
+                                    title = [[location labels] firstObject];
+                                    if ([[location labels] count] > 1) {
+                                        subtitle = [[location labels] objectAtIndex:1];
+                                    }
+                                }
+
+                                double lat = [location latitude];
+                                double lon = [location longitude];
+                                double ts = [location timestamp];
+                                long long locType = [location locationType];
+
+                                NSDictionary *locDetails = @{
+                                    @"handle": handleId ?: [NSNull null],
+                                    @"coordinates": @[@(lat), @(lon)],
+                                    @"long_address": longAddress ?: [NSNull null],
+                                    @"short_address": shortAddress ?: [NSNull null],
+                                    @"title": title ?: [NSNull null],
+                                    @"subtitle": subtitle ?: [NSNull null],
+                                    @"last_updated": [NSNumber numberWithDouble:round(ts) * 1000],
+                                    @"is_locating_in_progress": @(0),
+                                    @"status": (locType == 0) ? @"legacy" : (locType == 2) ? @"live" : @"shallow"
+                                };
+
+                                [locationsLock lock];
+                                [locations addObject:locDetails];
+                                [locationsLock unlock];
+
+                                [completedLock lock];
+                                [completedHandles addObject:handleId];
+                                NSUInteger completed = [completedHandles count];
+                                [completedLock unlock];
+
+                                // If all handles have reported, send the response immediately
+                                if (completed >= totalHandles) {
+                                    DLog("BLUEBUBBLESHELPER: All %lu friend locations received", (unsigned long)totalHandles);
+
+                                    // Restore original callback
+                                    [session setLocationUpdateCallback:originalCallback];
+
+                                    [locationsLock lock];
+                                    NSArray *locationsCopy = [locations copy];
+                                    [locationsLock unlock];
+
+                                    if (txn != nil) {
+                                        [[NetworkController sharedInstance] sendMessage: @{
+                                            @"transactionId": txn,
+                                            @"locations": locationsCopy,
+                                        }];
+                                    }
+                                }
+                            } @catch (NSException *e) {
+                                DLog("BLUEBUBBLESHELPER: Error in locationUpdateCallback: %@", e);
+                            }
+                        }];
+
+                        // Now trigger the refresh for all handles at once
+                        [session startRefreshingLocationForHandles:allHandles priority:1000 isFromGroup:NO reverseGeocode:YES completion:^() {
+                            DLog("BLUEBUBBLESHELPER: startRefreshingLocationForHandles completion fired");
+                            // The actual locations come via locationUpdateCallback, not here.
+                            // But let's also try to grab cached locations as a fallback.
+                            @try {
+                                for (NSObject *handle in allHandles) {
+                                    NSString *handleId = nil;
+                                    if ([handle respondsToSelector:@selector(identifier)]) {
+                                        handleId = [handle performSelector:@selector(identifier)];
+                                    }
+                                    if (handleId == nil) continue;
+
+                                    [completedLock lock];
+                                    BOOL alreadyCompleted = [completedHandles containsObject:handleId];
+                                    [completedLock unlock];
+
+                                    if (!alreadyCompleted) {
+                                        FMLLocation *cachedLoc = [session cachedLocationForHandle:handle includeAddress:YES];
+                                        if (cachedLoc != nil && [cachedLoc latitude] != 0 && [cachedLoc longitude] != 0) {
+                                            DLog("BLUEBUBBLESHELPER: Using cached location for %@", handleId);
+
+                                            NSString *longAddress = nil;
+                                            NSString *shortAddress = nil;
+                                            NSString *title = nil;
+                                            NSString *subtitle = nil;
+
+                                            if ([cachedLoc respondsToSelector:@selector(address)] && [cachedLoc address] != nil) {
+                                                longAddress = [[cachedLoc address] description];
+                                            }
+                                            if ([cachedLoc respondsToSelector:@selector(coarseAddressLabel)] && [cachedLoc coarseAddressLabel] != nil) {
+                                                shortAddress = [cachedLoc coarseAddressLabel];
+                                            }
+                                            if ([cachedLoc respondsToSelector:@selector(labels)] && [cachedLoc labels] != nil && [[cachedLoc labels] count] > 0) {
+                                                title = [[cachedLoc labels] firstObject];
+                                                if ([[cachedLoc labels] count] > 1) {
+                                                    subtitle = [[cachedLoc labels] objectAtIndex:1];
+                                                }
+                                            }
+
+                                            NSDictionary *locDetails = @{
+                                                @"handle": handleId ?: [NSNull null],
+                                                @"coordinates": @[@([cachedLoc latitude]), @([cachedLoc longitude])],
+                                                @"long_address": longAddress ?: [NSNull null],
+                                                @"short_address": shortAddress ?: [NSNull null],
+                                                @"title": title ?: [NSNull null],
+                                                @"subtitle": subtitle ?: [NSNull null],
+                                                @"last_updated": [NSNumber numberWithDouble:round([cachedLoc timestamp]) * 1000],
+                                                @"is_locating_in_progress": @(0),
+                                                @"status": ([cachedLoc locationType] == 0) ? @"legacy" : ([cachedLoc locationType] == 2) ? @"live" : @"shallow"
+                                            };
+
+                                            [locationsLock lock];
+                                            [locations addObject:locDetails];
+                                            [locationsLock unlock];
+
+                                            [completedLock lock];
+                                            [completedHandles addObject:handleId];
+                                            NSUInteger completed = [completedHandles count];
+                                            [completedLock unlock];
+
+                                            if (completed >= totalHandles) {
+                                                DLog("BLUEBUBBLESHELPER: All %lu friend locations received (via cache fallback)", (unsigned long)totalHandles);
+                                                [session setLocationUpdateCallback:originalCallback];
+
+                                                [locationsLock lock];
+                                                NSArray *locationsCopy = [locations copy];
+                                                [locationsLock unlock];
+
+                                                if (txn != nil) {
+                                                    [[NetworkController sharedInstance] sendMessage: @{
+                                                        @"transactionId": txn,
+                                                        @"locations": locationsCopy,
+                                                    }];
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } @catch (NSException *e) {
+                                DLog("BLUEBUBBLESHELPER: Error in startRefreshingLocation completion: %@", e);
+                            }
+                        }];
+                    } @catch (NSException *e) {
+                        DLog("BLUEBUBBLESHELPER: Error in getFriendsSharingLocationsWithMe completion: %@", e);
+                        if (txn != nil) {
+                            [[NetworkController sharedInstance] sendMessage: @{
+                                @"transactionId": txn,
+                                @"locations": @[],
+                                @"error": [e reason] ?: @"Unknown error"
+                            }];
+                        }
+                    }
+                }];
+            } @catch (NSException *e) {
+                DLog("BLUEBUBBLESHELPER: Error in refresh-findmy-friends (macOS 14+): %@", e);
+                if (transaction != nil) {
+                    [[NetworkController sharedInstance] sendMessage: @{
+                        @"transactionId": transaction,
+                        @"locations": @[],
+                        @"error": [e reason] ?: @"Unknown error"
                     }];
                 }
-            }];
-            
-            if (transaction != nil) {
-                NSDictionary *data = @{
-                    @"transactionId": transaction,
-                    @"locations": @[],
-                };
-                [[NetworkController sharedInstance] sendMessage: data];
             }
         } else {
             FMFSession *session = [[IMFMFSession sharedInstance] session];
@@ -1249,12 +1504,162 @@ ZKSwizzleInterface(BBH_IMChat, IMChat, NSObject)
 
 @end
 
-ZKSwizzleInterface(BBH_FindMyLocateSession, FindMyLocateSession, NSObject)
-@implementation BBH_FindMyLocateSession
+// On macOS 14+, real-time location updates come through IMFMFSession's didReceiveLocationForHandle:
+// which is triggered by FindMyLocateSession's locationUpdateCallback. We swizzle IMFMFSession below.
 
-- (id /* block */)locationUpdateCallback {
-    DLog("BLUEBUBBLESHELPER: fired");
-    return ZKOrig(id);
+// Handle real-time FindMy location updates on macOS 14+ via IMFMFSession
+ZKSwizzleInterface(BBH_IMFMFSession, IMFMFSession, NSObject)
+@implementation BBH_IMFMFSession
+
+- (void)didReceiveLocationForHandle:(id)arg1 {
+    // Call the original implementation first so internal state is updated
+    ZKOrig(void, arg1);
+
+    // Only emit real-time events on macOS 14+ since FMFSessionDataManager swizzle handles <=13
+    if ([[NSProcessInfo processInfo] operatingSystemVersion].majorVersion <= 13) {
+        return;
+    }
+
+    @try {
+        if (arg1 == nil) return;
+
+        // On macOS 14+, get the location from the FindMyLocateSession cache
+        FindMyLocateSession *fmlSession = [(IMFMFSession *)self fmlSession];
+        if (fmlSession == nil) return;
+
+        // arg1 is an IMHandle or similar - we need to find the corresponding FMLHandle
+        // Use findMyLocationForHandle: on IMFMFSession which works across both code paths
+        NSObject *locationObj = [(IMFMFSession *)self findMyLocationForHandle:arg1];
+        DLog("BLUEBUBBLESHELPER: [Swizzle] didReceiveLocationForHandle: %@ -> location: %@", arg1, locationObj);
+
+        if (locationObj == nil) return;
+
+        // The location object could be FMFLocation or FMLLocation depending on the code path
+        // On macOS 14+ it should be mapped to FMFLocation by IMFMFSession
+        NSString *handleId = nil;
+        if ([arg1 respondsToSelector:@selector(id)]) {
+            handleId = [arg1 performSelector:@selector(id)];
+        }
+        if (handleId == nil && [arg1 respondsToSelector:NSSelectorFromString(@"identifier")]) {
+            handleId = [arg1 performSelector:NSSelectorFromString(@"identifier")];
+        }
+        if (handleId == nil && [arg1 isKindOfClass:[NSString class]]) {
+            handleId = (NSString *)arg1;
+        }
+        if (handleId == nil) {
+            DLog("BLUEBUBBLESHELPER: [Swizzle] Could not extract handle identifier");
+            return;
+        }
+
+        // Try to extract location data - handle both FMFLocation and FMLLocation types
+        NSMutableDictionary *locDetails = [[NSMutableDictionary alloc] init];
+        [locDetails setValue:(handleId ?: [NSNull null]) forKey:@"handle"];
+        [locDetails setValue:@(0) forKey:@"is_locating_in_progress"];
+
+        if ([locationObj isKindOfClass:NSClassFromString(@"FMFLocation")]) {
+            FMFLocation *fmfLoc = (FMFLocation *)locationObj;
+            NSInteger locType = ([[NSProcessInfo processInfo] operatingSystemVersion].majorVersion < 13) ? 0 : [fmfLoc locationType];
+            [locDetails setValue:@[@([fmfLoc coordinate].latitude), @([fmfLoc coordinate].longitude)] forKey:@"coordinates"];
+            [locDetails setValue:([fmfLoc longAddress] ?: [NSNull null]) forKey:@"long_address"];
+            [locDetails setValue:([fmfLoc shortAddress] ?: [NSNull null]) forKey:@"short_address"];
+            [locDetails setValue:([fmfLoc title] ?: [NSNull null]) forKey:@"title"];
+            [locDetails setValue:([fmfLoc subtitle] ?: [NSNull null]) forKey:@"subtitle"];
+            [locDetails setValue:[NSNumber numberWithDouble:round([[fmfLoc timestamp] timeIntervalSince1970]) * 1000] forKey:@"last_updated"];
+            [locDetails setValue:[NSNumber numberWithBool:[fmfLoc isLocatingInProgress]] forKey:@"is_locating_in_progress"];
+            [locDetails setValue:((locType == 0) ? @"legacy" : (locType == 2) ? @"live" : @"shallow") forKey:@"status"];
+
+            double lat = [fmfLoc coordinate].latitude;
+            double lon = [fmfLoc coordinate].longitude;
+
+            if (lat == 0 && lon == 0 && [fmfLoc longAddress] != nil) {
+                DLog("BLUEBUBBLESHELPER: [Swizzle] Geocoding location for %@", handleId);
+                [[[CLGeocoder alloc] init] geocodeAddressString:[fmfLoc longAddress] completionHandler:^(NSArray<CLPlacemark*>* placemarks, NSError* error) {
+                    @try {
+                        if (placemarks.count > 0) {
+                            CLLocation *coords = [[placemarks firstObject] location];
+                            [locDetails setValue:@[@([coords coordinate].latitude), @([coords coordinate].longitude)] forKey:@"coordinates"];
+                        }
+                        [[NetworkController sharedInstance] sendMessage:@{
+                            @"event": @"new-findmy-location",
+                            @"data": @[locDetails],
+                        }];
+                    } @catch (NSException *e) {
+                        DLog("BLUEBUBBLESHELPER: [Swizzle] Geocoding error: %@", e);
+                    }
+                }];
+            } else {
+                [[NetworkController sharedInstance] sendMessage:@{
+                    @"event": @"new-findmy-location",
+                    @"data": @[locDetails],
+                }];
+            }
+        } else {
+            // Fallback: try to read FMLLocation properties via selectors
+            double lat = 0, lon = 0, ts = 0;
+            long long locType = 0;
+            NSString *longAddress = nil;
+            NSString *shortAddress = nil;
+            NSString *title = nil;
+            NSString *subtitle = nil;
+
+            if ([locationObj respondsToSelector:@selector(latitude)]) {
+                lat = [(FMLLocation *)locationObj latitude];
+            }
+            if ([locationObj respondsToSelector:@selector(longitude)]) {
+                lon = [(FMLLocation *)locationObj longitude];
+            }
+            if ([locationObj respondsToSelector:@selector(timestamp)]) {
+                ts = [(FMLLocation *)locationObj timestamp];
+            }
+            if ([locationObj respondsToSelector:@selector(locationType)]) {
+                locType = [(FMLLocation *)locationObj locationType];
+            }
+            if ([locationObj respondsToSelector:@selector(address)] && [(FMLLocation *)locationObj address] != nil) {
+                longAddress = [[(FMLLocation *)locationObj address] description];
+            }
+            if ([locationObj respondsToSelector:@selector(coarseAddressLabel)]) {
+                shortAddress = [(FMLLocation *)locationObj coarseAddressLabel];
+            }
+            if ([locationObj respondsToSelector:@selector(labels)] && [(FMLLocation *)locationObj labels] != nil && [[(FMLLocation *)locationObj labels] count] > 0) {
+                title = [[(FMLLocation *)locationObj labels] firstObject];
+                if ([[(FMLLocation *)locationObj labels] count] > 1) {
+                    subtitle = [[(FMLLocation *)locationObj labels] objectAtIndex:1];
+                }
+            }
+
+            [locDetails setValue:@[@(lat), @(lon)] forKey:@"coordinates"];
+            [locDetails setValue:(longAddress ?: [NSNull null]) forKey:@"long_address"];
+            [locDetails setValue:(shortAddress ?: [NSNull null]) forKey:@"short_address"];
+            [locDetails setValue:(title ?: [NSNull null]) forKey:@"title"];
+            [locDetails setValue:(subtitle ?: [NSNull null]) forKey:@"subtitle"];
+            [locDetails setValue:[NSNumber numberWithDouble:round(ts) * 1000] forKey:@"last_updated"];
+            [locDetails setValue:((locType == 0) ? @"legacy" : (locType == 2) ? @"live" : @"shallow") forKey:@"status"];
+
+            if (lat == 0 && lon == 0 && longAddress != nil) {
+                [[[CLGeocoder alloc] init] geocodeAddressString:longAddress completionHandler:^(NSArray<CLPlacemark*>* placemarks, NSError* error) {
+                    @try {
+                        if (placemarks.count > 0) {
+                            CLLocation *coords = [[placemarks firstObject] location];
+                            [locDetails setValue:@[@([coords coordinate].latitude), @([coords coordinate].longitude)] forKey:@"coordinates"];
+                        }
+                        [[NetworkController sharedInstance] sendMessage:@{
+                            @"event": @"new-findmy-location",
+                            @"data": @[locDetails],
+                        }];
+                    } @catch (NSException *e) {
+                        DLog("BLUEBUBBLESHELPER: [Swizzle] Geocoding error: %@", e);
+                    }
+                }];
+            } else {
+                [[NetworkController sharedInstance] sendMessage:@{
+                    @"event": @"new-findmy-location",
+                    @"data": @[locDetails],
+                }];
+            }
+        }
+    } @catch (NSException *e) {
+        DLog("BLUEBUBBLESHELPER: [Swizzle] Error in didReceiveLocationForHandle: %@", e);
+    }
 }
 
 @end
