@@ -52,6 +52,8 @@
 #import "FMLHandle.h"
 #import "FMLLocation.h"
 #import "FMFSessionDataManager.h"
+#import "IMFindMyHandle.h"
+#import "IMFindMyLocation.h"
 
 @interface BlueBubblesHelper : NSObject
 + (instancetype)sharedInstance;
@@ -776,16 +778,39 @@ NSMutableArray* vettedAliases;
                         DLog("BLUEBUBBLESHELPER: Found %lu friends sharing locations", (unsigned long)[friends count]);
 
                         // Collect all handles from friends
+                        // On macOS 14-15: friends may be objects with a .handle property returning FMLHandle
+                        // On macOS 26+: friends may be FMLHandle directly, or have .identifier
                         NSMutableArray *allHandles = [[NSMutableArray alloc] init];
                         for (NSObject *friendObj in friends) {
                             @try {
+                                DLog("BLUEBUBBLESHELPER: Friend object class: %@, description: %@", [friendObj class], friendObj);
+                                // Try .handle first (macOS 14-15 friendship objects)
                                 if ([friendObj respondsToSelector:NSSelectorFromString(@"handle")]) {
                                     NSObject *handle = [friendObj performSelector:NSSelectorFromString(@"handle")];
                                     if (handle != nil) {
                                         [allHandles addObject:handle];
-                                        DLog("BLUEBUBBLESHELPER: Found friend handle: %@", handle);
+                                        DLog("BLUEBUBBLESHELPER: Found friend via .handle: %@", handle);
+                                        continue;
                                     }
                                 }
+                                // macOS 26+: friendObj might already be an FMLHandle or IMFindMyHandle
+                                // If it has .identifier, it's likely a handle object itself
+                                if ([friendObj respondsToSelector:@selector(identifier)]) {
+                                    // It's already a handle-like object, use it directly
+                                    [allHandles addObject:friendObj];
+                                    DLog("BLUEBUBBLESHELPER: Friend is handle-like (has .identifier): %@", [(id)friendObj identifier]);
+                                    continue;
+                                }
+                                // macOS 26+: try .fmlHandle (IMFindMyHandle wraps FMLHandle)
+                                if ([friendObj respondsToSelector:NSSelectorFromString(@"fmlHandle")]) {
+                                    NSObject *fmlHandle = [friendObj performSelector:NSSelectorFromString(@"fmlHandle")];
+                                    if (fmlHandle != nil) {
+                                        [allHandles addObject:fmlHandle];
+                                        DLog("BLUEBUBBLESHELPER: Found friend via .fmlHandle: %@", fmlHandle);
+                                        continue;
+                                    }
+                                }
+                                DLog("BLUEBUBBLESHELPER: Could not extract handle from friend object: %@", friendObj);
                             } @catch (NSException *e) {
                                 DLog("BLUEBUBBLESHELPER: Error getting handle from friend: %@", e);
                             }
@@ -845,15 +870,38 @@ NSMutableArray* vettedAliases;
                         });
 
                         // Set the locationUpdateCallback to capture location updates
-                        [session setLocationUpdateCallback:^(FMLLocation *location, FMLHandle *handle) {
+                        // Use id types for safety — macOS 26 may pass different object types
+                        [session setLocationUpdateCallback:^(id locationArg, id handleArg) {
                             @try {
-                                if (location == nil || handle == nil) {
+                                if (locationArg == nil || handleArg == nil) {
                                     DLog("BLUEBUBBLESHELPER: locationUpdateCallback fired with nil location or handle");
                                     return;
                                 }
 
-                                NSString *handleId = [handle identifier];
+                                DLog("BLUEBUBBLESHELPER: locationUpdateCallback: location class=%@, handle class=%@", [locationArg class], [handleArg class]);
+
+                                // Extract handle identifier - works for FMLHandle, IMFindMyHandle, or any object with .identifier
+                                NSString *handleId = nil;
+                                if ([handleArg respondsToSelector:@selector(identifier)]) {
+                                    handleId = [handleArg performSelector:@selector(identifier)];
+                                }
+                                if (handleId == nil) {
+                                    DLog("BLUEBUBBLESHELPER: Could not extract identifier from handle: %@", handleArg);
+                                    return;
+                                }
                                 DLog("BLUEBUBBLESHELPER: Got location update for handle: %@", handleId);
+
+                                // Unwrap IMFindMyLocation to get inner FMLLocation if needed (macOS 26+)
+                                FMLLocation *location = nil;
+                                if ([locationArg isKindOfClass:NSClassFromString(@"FMLLocation")]) {
+                                    location = (FMLLocation *)locationArg;
+                                } else if ([locationArg respondsToSelector:@selector(fmlLocation)]) {
+                                    location = [locationArg performSelector:@selector(fmlLocation)];
+                                }
+                                if (location == nil) {
+                                    DLog("BLUEBUBBLESHELPER: Could not extract FMLLocation from: %@ (%@)", locationArg, [locationArg class]);
+                                    return;
+                                }
 
                                 // Build location dictionary matching the macOS <=13 format
                                 NSString *longAddress = nil;
@@ -1523,35 +1571,60 @@ ZKSwizzleInterface(BBH_IMFMFSession, IMFMFSession, NSObject)
     @try {
         if (arg1 == nil) return;
 
-        // On macOS 14+, get the location from the FindMyLocateSession cache
-        FindMyLocateSession *fmlSession = [(IMFMFSession *)self fmlSession];
-        if (fmlSession == nil) return;
-
-        // arg1 is an IMHandle or similar - we need to find the corresponding FMLHandle
-        // Use findMyLocationForHandle: on IMFMFSession which works across both code paths
-        NSObject *locationObj = [(IMFMFSession *)self findMyLocationForHandle:arg1];
-        DLog("BLUEBUBBLESHELPER: [Swizzle] didReceiveLocationForHandle: %@ -> location: %@", arg1, locationObj);
-
-        if (locationObj == nil) return;
-
-        // The location object could be FMFLocation or FMLLocation depending on the code path
-        // On macOS 14+ it should be mapped to FMFLocation by IMFMFSession
+        NSObject *locationObj = nil;
         NSString *handleId = nil;
-        if ([arg1 respondsToSelector:@selector(id)]) {
-            handleId = [arg1 performSelector:@selector(id)];
+
+        // macOS 26+ (Tahoe): arg1 is IMFindMyHandle, use findMyLocationForFindMyHandle:
+        Class imFindMyHandleClass = NSClassFromString(@"IMFindMyHandle");
+        if (imFindMyHandleClass && [arg1 isKindOfClass:imFindMyHandleClass]) {
+            handleId = [(IMFindMyHandle *)arg1 identifier];
+            DLog("BLUEBUBBLESHELPER: [Swizzle] didReceiveLocationForHandle (macOS 26+): IMFindMyHandle=%@", handleId);
+
+            if ([(IMFMFSession *)self respondsToSelector:@selector(findMyLocationForFindMyHandle:)]) {
+                NSObject *imFindMyLoc = [(IMFMFSession *)self findMyLocationForFindMyHandle:arg1];
+                DLog("BLUEBUBBLESHELPER: [Swizzle] findMyLocationForFindMyHandle returned: %@", imFindMyLoc);
+                if (imFindMyLoc == nil) return;
+
+                // IMFindMyLocation wraps fmlLocation and fmfLocation
+                // Try fmlLocation first (newer API), then fmfLocation as fallback
+                if ([imFindMyLoc respondsToSelector:@selector(fmlLocation)]) {
+                    locationObj = [(IMFindMyLocation *)imFindMyLoc fmlLocation];
+                }
+                if (locationObj == nil && [imFindMyLoc respondsToSelector:@selector(fmfLocation)]) {
+                    locationObj = [(IMFindMyLocation *)imFindMyLoc fmfLocation];
+                }
+                if (locationObj == nil) {
+                    DLog("BLUEBUBBLESHELPER: [Swizzle] IMFindMyLocation has no inner fmlLocation/fmfLocation");
+                    return;
+                }
+            } else {
+                DLog("BLUEBUBBLESHELPER: [Swizzle] IMFMFSession does not respond to findMyLocationForFindMyHandle:");
+                return;
+            }
+        } else {
+            // macOS 14-15: arg1 is IMHandle or similar, use findMyLocationForHandle:
+            locationObj = [(IMFMFSession *)self findMyLocationForHandle:arg1];
+            DLog("BLUEBUBBLESHELPER: [Swizzle] didReceiveLocationForHandle (macOS 14-15): %@ -> location: %@", arg1, locationObj);
+            if (locationObj == nil) return;
+
+            // Extract handle ID from IMHandle
+            if ([arg1 respondsToSelector:@selector(id)]) {
+                handleId = [arg1 performSelector:@selector(id)];
+            }
+            if (handleId == nil && [arg1 respondsToSelector:NSSelectorFromString(@"identifier")]) {
+                handleId = [arg1 performSelector:NSSelectorFromString(@"identifier")];
+            }
+            if (handleId == nil && [arg1 isKindOfClass:[NSString class]]) {
+                handleId = (NSString *)arg1;
+            }
         }
-        if (handleId == nil && [arg1 respondsToSelector:NSSelectorFromString(@"identifier")]) {
-            handleId = [arg1 performSelector:NSSelectorFromString(@"identifier")];
-        }
-        if (handleId == nil && [arg1 isKindOfClass:[NSString class]]) {
-            handleId = (NSString *)arg1;
-        }
+
         if (handleId == nil) {
-            DLog("BLUEBUBBLESHELPER: [Swizzle] Could not extract handle identifier");
+            DLog("BLUEBUBBLESHELPER: [Swizzle] Could not extract handle identifier from %@", [arg1 class]);
             return;
         }
 
-        // Try to extract location data - handle both FMFLocation and FMLLocation types
+        // Build location details - handle FMFLocation, FMLLocation, or unknown location types
         NSMutableDictionary *locDetails = [[NSMutableDictionary alloc] init];
         [locDetails setValue:(handleId ?: [NSNull null]) forKey:@"handle"];
         [locDetails setValue:@(0) forKey:@"is_locating_in_progress"];
@@ -1594,7 +1667,7 @@ ZKSwizzleInterface(BBH_IMFMFSession, IMFMFSession, NSObject)
                 }];
             }
         } else {
-            // Fallback: try to read FMLLocation properties via selectors
+            // Fallback: try to read FMLLocation properties via selectors (macOS 14+ / macOS 26+)
             double lat = 0, lon = 0, ts = 0;
             long long locType = 0;
             NSString *longAddress = nil;
@@ -1626,6 +1699,8 @@ ZKSwizzleInterface(BBH_IMFMFSession, IMFMFSession, NSObject)
                     subtitle = [[(FMLLocation *)locationObj labels] objectAtIndex:1];
                 }
             }
+
+            DLog("BLUEBUBBLESHELPER: [Swizzle] FMLLocation for %@: lat=%f, lon=%f, ts=%f, type=%lld", handleId, lat, lon, ts, locType);
 
             [locDetails setValue:@[@(lat), @(lon)] forKey:@"coordinates"];
             [locDetails setValue:(longAddress ?: [NSNull null]) forKey:@"long_address"];
