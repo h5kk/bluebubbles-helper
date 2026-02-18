@@ -54,6 +54,7 @@
 #import "FMFSessionDataManager.h"
 #import "IMFindMyHandle.h"
 #import "IMFindMyLocation.h"
+#import <Contacts/Contacts.h>
 
 @interface BlueBubblesHelper : NSObject
 + (instancetype)sharedInstance;
@@ -1478,6 +1479,198 @@ NSMutableArray* vettedAliases;
                 [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"error": [ex reason] ?: @"Unknown error"}];
             }
         }
+    // ========================
+    // Contact Write Operations
+    // ========================
+    } else if ([event isEqualToString:@"create-contact"]) {
+        @try {
+            NSString *firstName = data[@"firstName"];
+            NSString *lastName = data[@"lastName"];
+            NSArray *phones = data[@"phones"];
+            NSArray *emails = data[@"emails"];
+
+            if (firstName == nil || ![firstName isKindOfClass:[NSString class]] || [firstName length] == 0) {
+                if (transaction != nil) {
+                    [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"error": @"firstName is required"}];
+                }
+                return;
+            }
+
+            CNContactStore *store = [[CNContactStore alloc] init];
+            CNMutableContact *contact = [[CNMutableContact alloc] init];
+            [contact setGivenName:firstName];
+            if (lastName != nil && [lastName isKindOfClass:[NSString class]]) {
+                [contact setFamilyName:lastName];
+            }
+
+            // Add phone numbers
+            if (phones != nil && [phones isKindOfClass:[NSArray class]]) {
+                NSMutableArray *phoneValues = [NSMutableArray array];
+                for (NSString *phone in phones) {
+                    if ([phone isKindOfClass:[NSString class]]) {
+                        CNPhoneNumber *pn = [CNPhoneNumber phoneNumberWithStringValue:phone];
+                        CNLabeledValue *lv = [CNLabeledValue labeledValueWithLabel:CNLabelPhoneNumberMobile value:pn];
+                        [phoneValues addObject:lv];
+                    }
+                }
+                [contact setPhoneNumbers:phoneValues];
+            }
+
+            // Add email addresses
+            if (emails != nil && [emails isKindOfClass:[NSArray class]]) {
+                NSMutableArray *emailValues = [NSMutableArray array];
+                for (NSString *email in emails) {
+                    if ([email isKindOfClass:[NSString class]]) {
+                        CNLabeledValue *lv = [CNLabeledValue labeledValueWithLabel:CNLabelHome value:email];
+                        [emailValues addObject:lv];
+                    }
+                }
+                [contact setEmailAddresses:emailValues];
+            }
+
+            CNSaveRequest *saveRequest = [[CNSaveRequest alloc] init];
+            [saveRequest addContact:contact toContainerWithIdentifier:[store defaultContainerIdentifier]];
+            NSError *saveError = nil;
+            BOOL success = [store executeSaveRequest:saveRequest error:&saveError];
+
+            if (success) {
+                if (transaction != nil) {
+                    [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"data": @{@"success": @(YES), @"cnContactID": [contact identifier] ?: [NSNull null], @"firstName": firstName, @"lastName": lastName ?: [NSNull null]}}];
+                }
+            } else {
+                if (transaction != nil) {
+                    NSString *errMsg = saveError ? [saveError localizedDescription] : @"Unknown save error";
+                    [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"error": errMsg}];
+                }
+            }
+        } @catch (NSException *ex) {
+            DLog("BLUEBUBBLESHELPER: Error creating contact: %{public}@", ex);
+            if (transaction != nil) {
+                [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"error": [ex reason] ?: @"Unknown error"}];
+            }
+        }
+
+    } else if ([event isEqualToString:@"update-contact"]) {
+        @try {
+            NSString *cnContactID = data[@"cnContactID"];
+            NSString *firstName = data[@"firstName"];
+            NSString *lastName = data[@"lastName"];
+            NSArray *phones = data[@"phones"];
+            NSArray *emails = data[@"emails"];
+
+            if (cnContactID == nil || ![cnContactID isKindOfClass:[NSString class]] || [cnContactID length] == 0) {
+                if (transaction != nil) {
+                    [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"error": @"cnContactID is required"}];
+                }
+                return;
+            }
+
+            CNContactStore *store = [[CNContactStore alloc] init];
+            NSArray *keysToFetch = @[CNContactGivenNameKey, CNContactFamilyNameKey, CNContactPhoneNumbersKey, CNContactEmailAddressesKey];
+            CNContact *existing = [store unifiedContactWithIdentifier:cnContactID keysToFetch:keysToFetch error:nil];
+            if (existing == nil) {
+                if (transaction != nil) {
+                    [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"error": @"Contact not found"}];
+                }
+                return;
+            }
+
+            CNMutableContact *mutable = [existing mutableCopy];
+
+            if (firstName != nil && [firstName isKindOfClass:[NSString class]]) {
+                [mutable setGivenName:firstName];
+            }
+            if (lastName != nil && [lastName isKindOfClass:[NSString class]]) {
+                [mutable setFamilyName:lastName];
+            }
+            if (phones != nil && [phones isKindOfClass:[NSArray class]]) {
+                NSMutableArray *phoneValues = [NSMutableArray array];
+                for (NSString *phone in phones) {
+                    if ([phone isKindOfClass:[NSString class]]) {
+                        CNPhoneNumber *pn = [CNPhoneNumber phoneNumberWithStringValue:phone];
+                        CNLabeledValue *lv = [CNLabeledValue labeledValueWithLabel:CNLabelPhoneNumberMobile value:pn];
+                        [phoneValues addObject:lv];
+                    }
+                }
+                [mutable setPhoneNumbers:phoneValues];
+            }
+            if (emails != nil && [emails isKindOfClass:[NSArray class]]) {
+                NSMutableArray *emailValues = [NSMutableArray array];
+                for (NSString *email in emails) {
+                    if ([email isKindOfClass:[NSString class]]) {
+                        CNLabeledValue *lv = [CNLabeledValue labeledValueWithLabel:CNLabelHome value:email];
+                        [emailValues addObject:lv];
+                    }
+                }
+                [mutable setEmailAddresses:emailValues];
+            }
+
+            CNSaveRequest *saveRequest = [[CNSaveRequest alloc] init];
+            [saveRequest updateContact:mutable];
+            NSError *saveError = nil;
+            BOOL success = [store executeSaveRequest:saveRequest error:&saveError];
+
+            if (success) {
+                if (transaction != nil) {
+                    [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"data": @{@"success": @(YES), @"cnContactID": cnContactID, @"firstName": [mutable givenName] ?: [NSNull null], @"lastName": [mutable familyName] ?: [NSNull null]}}];
+                }
+            } else {
+                if (transaction != nil) {
+                    NSString *errMsg = saveError ? [saveError localizedDescription] : @"Unknown save error";
+                    [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"error": errMsg}];
+                }
+            }
+        } @catch (NSException *ex) {
+            DLog("BLUEBUBBLESHELPER: Error updating contact: %{public}@", ex);
+            if (transaction != nil) {
+                [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"error": [ex reason] ?: @"Unknown error"}];
+            }
+        }
+
+    } else if ([event isEqualToString:@"delete-contact"]) {
+        @try {
+            NSString *cnContactID = data[@"cnContactID"];
+
+            if (cnContactID == nil || ![cnContactID isKindOfClass:[NSString class]] || [cnContactID length] == 0) {
+                if (transaction != nil) {
+                    [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"error": @"cnContactID is required"}];
+                }
+                return;
+            }
+
+            CNContactStore *store = [[CNContactStore alloc] init];
+            NSArray *keysToFetch = @[CNContactIdentifierKey];
+            CNContact *existing = [store unifiedContactWithIdentifier:cnContactID keysToFetch:keysToFetch error:nil];
+            if (existing == nil) {
+                if (transaction != nil) {
+                    [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"error": @"Contact not found"}];
+                }
+                return;
+            }
+
+            CNMutableContact *mutable = [existing mutableCopy];
+            CNSaveRequest *saveRequest = [[CNSaveRequest alloc] init];
+            [saveRequest deleteContact:mutable];
+            NSError *saveError = nil;
+            BOOL success = [store executeSaveRequest:saveRequest error:&saveError];
+
+            if (success) {
+                if (transaction != nil) {
+                    [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"data": @{@"success": @(YES), @"cnContactID": cnContactID}}];
+                }
+            } else {
+                if (transaction != nil) {
+                    NSString *errMsg = saveError ? [saveError localizedDescription] : @"Unknown save error";
+                    [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"error": errMsg}];
+                }
+            }
+        } @catch (NSException *ex) {
+            DLog("BLUEBUBBLESHELPER: Error deleting contact: %{public}@", ex);
+            if (transaction != nil) {
+                [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"error": [ex reason] ?: @"Unknown error"}];
+            }
+        }
+
     } else if ([event isEqualToString:@"search-messages"]) {
         NSString* query = data[@"query"];
         NSString* matchType = data[@"matchType"];
