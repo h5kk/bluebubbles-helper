@@ -27,12 +27,16 @@ This is the repo for the bundle containing code to perform various tasks not acc
 - Delete chats
 - Delete messages
 - Check user iMessage and FaceTime status
+- Refresh Find My friend locations (requires macOS 11+)
+- Real-time Find My location updates via swizzle hooks (requires macOS 11+)
 
 See [here](https://docs.bluebubbles.app/helper-bundle/imcore-documentation) for more details on how these were implemented.
 
+For detailed Find My integration documentation, see [bluebubbles-server/docs/FINDMY.md](../bluebubbles-server/docs/FINDMY.md).
+
 ### Support
 
-The bundle has been tested on MacOS 10.13 (High Sierra) - MacOS 13 (Ventura). It could work on higher or lower MacOS versions, but we do not know for sure.
+The bundle has been tested on MacOS 10.13 (High Sierra) - MacOS 15 (Sequoia). The Find My integration has been tested on macOS 11 (Big Sur) through macOS 26 (Tahoe).
 
 ### Build Yourself
 
