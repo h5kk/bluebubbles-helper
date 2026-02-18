@@ -23,6 +23,7 @@
 		A69960EA2B1F9A700081FB69 /* FMF.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A69960E92B1F9A6F0081FB69 /* FMF.framework */; };
 		A69960F52B20D89C0081FB69 /* CTBlockDescription.m in Sources */ = {isa = PBXBuildFile; fileRef = A69960F42B20D8860081FB69 /* CTBlockDescription.m */; };
 		F8EA7496D989633D9E36BF1B /* libPods-BlueBubblesHelper DyLib.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 2A31F700CE646BC3B6A3921F /* libPods-BlueBubblesHelper DyLib.a */; };
+		AA0000012C000001000CNTCT /* Contacts.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA0000002C000000000CNTCT /* Contacts.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -134,6 +135,7 @@
 		FBCE4ED8201C0FDE002F8A61 /* IMPerson.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = IMPerson.h; sourceTree = "<group>"; };
 		FBCE4ED9201C0FDE002F8A61 /* IMHandle.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = IMHandle.h; sourceTree = "<group>"; };
 		FBCE4EDA201C0FDE002F8A61 /* IMAccount.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = IMAccount.h; sourceTree = "<group>"; };
+		AA0000002C000000000CNTCT /* Contacts.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Contacts.framework; path = /System/Library/Frameworks/Contacts.framework; sourceTree = "<absolute>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -149,6 +151,7 @@
 				A62991D7297210A500B7E663 /* Foundation.framework in Frameworks */,
 				A62991D02972104E00B7E663 /* AppKit.framework in Frameworks */,
 				F8EA7496D989633D9E36BF1B /* libPods-BlueBubblesHelper DyLib.a in Frameworks */,
+				AA0000012C000001000CNTCT /* Contacts.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -196,6 +199,7 @@
 		FBCE4EBD201C0F4D002F8A61 /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+				AA0000002C000000000CNTCT /* Contacts.framework */,
 				A69960ED2B2004540081FB69 /* FindMyLocateObjCWrapper.framework */,
 				A69960E92B1F9A6F0081FB69 /* FMF.framework */,
 				A61DC0272A59FFF200EA75A5 /* IDS.framework */,
