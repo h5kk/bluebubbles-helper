@@ -777,6 +777,64 @@ NSMutableArray* vettedAliases;
 
                         DLog("BLUEBUBBLESHELPER: Found %lu friends sharing locations", (unsigned long)[friends count]);
 
+                        // Build a lookup map: FMLHandle description → identifier string
+                        // IMFMFSession.findMyHandlesSharingLocationWithMe returns IMFindMyHandle objects
+                        // that have both .identifier (the handle string) and .fmlHandle (the underlying FMLHandle)
+                        NSMutableDictionary *handleIdMap = [NSMutableDictionary dictionary];
+                        @try {
+                            NSArray *imfmfHandles = [[IMFMFSession sharedInstance] findMyHandlesSharingLocationWithMe];
+                            for (id h in imfmfHandles) {
+                                @try {
+                                    NSString *ident = nil;
+                                    if ([h respondsToSelector:@selector(identifier)]) {
+                                        ident = [h performSelector:@selector(identifier)];
+                                    }
+                                    id fmlH = nil;
+                                    if ([h respondsToSelector:NSSelectorFromString(@"fmlHandle")]) {
+                                        fmlH = [h performSelector:NSSelectorFromString(@"fmlHandle")];
+                                    }
+                                    if (ident != nil && fmlH != nil) {
+                                        handleIdMap[[fmlH description]] = ident;
+                                    }
+                                } @catch (NSException *e) {
+                                    DLog("BLUEBUBBLESHELPER: Error mapping handle: %@", e);
+                                }
+                            }
+                            DLog("BLUEBUBBLESHELPER: Built handle ID map with %lu entries", (unsigned long)[handleIdMap count]);
+                        } @catch (NSException *e) {
+                            DLog("BLUEBUBBLESHELPER: Failed to build handle ID map: %@", e);
+                        }
+
+                        // Helper block: extract identifier from any handle-like object
+                        NSString *(^extractHandleId)(id) = ^NSString *(id handleObj) {
+                            if (handleObj == nil) return nil;
+                            // Try .identifier directly (IMFindMyHandle, IMHandle)
+                            if ([handleObj respondsToSelector:@selector(identifier)]) {
+                                NSString *ident = [handleObj performSelector:@selector(identifier)];
+                                if (ident != nil) return ident;
+                            }
+                            // Try .ID (IMHandle)
+                            if ([handleObj respondsToSelector:@selector(ID)]) {
+                                NSString *ident = [handleObj performSelector:@selector(ID)];
+                                if (ident != nil) return ident;
+                            }
+                            // Look up in our map by description
+                            NSString *desc = [handleObj description];
+                            NSString *mapped = handleIdMap[desc];
+                            if (mapped != nil) return mapped;
+                            // Last resort: parse description "Handle:+15042878167 Handle Type:1..."
+                            NSRange handleRange = [desc rangeOfString:@"Handle:"];
+                            if (handleRange.location != NSNotFound) {
+                                NSString *rest = [desc substringFromIndex:handleRange.location + handleRange.length];
+                                NSRange spaceRange = [rest rangeOfString:@" "];
+                                if (spaceRange.location != NSNotFound) {
+                                    return [rest substringToIndex:spaceRange.location];
+                                }
+                                return rest;
+                            }
+                            return nil;
+                        };
+
                         // Collect all handles from friends
                         // On macOS 14-15: friends may be objects with a .handle property returning FMLHandle
                         // On macOS 26+: friends may be FMLHandle directly, or have .identifier
@@ -880,13 +938,10 @@ NSMutableArray* vettedAliases;
 
                                 DLog("BLUEBUBBLESHELPER: locationUpdateCallback: location class=%@, handle class=%@", [locationArg class], [handleArg class]);
 
-                                // Extract handle identifier - works for FMLHandle, IMFindMyHandle, or any object with .identifier
-                                NSString *handleId = nil;
-                                if ([handleArg respondsToSelector:@selector(identifier)]) {
-                                    handleId = [handleArg performSelector:@selector(identifier)];
-                                }
+                                // Extract handle identifier using the multi-strategy helper
+                                NSString *handleId = extractHandleId(handleArg);
                                 if (handleId == nil) {
-                                    DLog("BLUEBUBBLESHELPER: Could not extract identifier from handle: %@", handleArg);
+                                    DLog("BLUEBUBBLESHELPER: Could not extract identifier from handle: %@ (%@)", handleArg, [handleArg class]);
                                     return;
                                 }
                                 DLog("BLUEBUBBLESHELPER: Got location update for handle: %@", handleId);
@@ -980,10 +1035,7 @@ NSMutableArray* vettedAliases;
                             // But let's also try to grab cached locations as a fallback.
                             @try {
                                 for (NSObject *handle in allHandles) {
-                                    NSString *handleId = nil;
-                                    if ([handle respondsToSelector:@selector(identifier)]) {
-                                        handleId = [handle performSelector:@selector(identifier)];
-                                    }
+                                    NSString *handleId = extractHandleId(handle);
                                     if (handleId == nil) continue;
 
                                     [completedLock lock];
@@ -1112,6 +1164,319 @@ NSMutableArray* vettedAliases;
             [session removeHandles:[session handles]];
             [session addHandles:handles];
             [session forceRefresh];
+        }
+    // Contact Private API handlers
+    } else if ([event isEqualToString:@"get-handles-contact-info"]) {
+        @try {
+            BOOL includePhotos = [data[@"includePhotos"] boolValue];
+            NSArray *allHandles = [[IMHandleRegistrar sharedInstance] allIMHandles];
+            NSMutableArray *results = [NSMutableArray array];
+            for (IMHandle *handle in allHandles) {
+                @try {
+                    NSMutableDictionary *info = [NSMutableDictionary dictionary];
+                    info[@"handleId"] = [handle ID] ?: [NSNull null];
+                    info[@"service"] = [(id)[handle service] name] ?: [NSNull null];
+                    info[@"fullName"] = [handle fullName] ?: [NSNull null];
+                    info[@"isContact"] = @([handle isContact]);
+                    info[@"isBusiness"] = @([handle respondsToSelector:@selector(isBusiness)] ? [handle isBusiness] : NO);
+                    info[@"personCentricID"] = [handle personCentricID] ?: [NSNull null];
+                    IMPerson *person = [handle respondsToSelector:@selector(person)] ? [handle person] : nil;
+                    info[@"cnContactID"] = (person && [person respondsToSelector:@selector(cnContactID)]) ? ([person cnContactID] ?: [NSNull null]) : [NSNull null];
+                    info[@"suggestedName"] = ([handle respondsToSelector:@selector(suggestedName)] ? ([handle suggestedName] ?: [NSNull null]) : [NSNull null]);
+                    NSArray *siblings = [handle respondsToSelector:@selector(siblingsArray)] ? [handle siblingsArray] : @[];
+                    NSMutableArray *siblingIds = [NSMutableArray array];
+                    for (IMHandle *sibling in siblings) {
+                        [siblingIds addObject:@{@"handleId": [sibling ID] ?: @"", @"service": [(id)[sibling service] name] ?: @""}];
+                    }
+                    info[@"siblings"] = siblingIds;
+                    if (includePhotos && [handle respondsToSelector:@selector(pictureData)]) {
+                        NSData *picData = [handle pictureData];
+                        info[@"photoBase64"] = picData ? [picData base64EncodedStringWithOptions:0] : [NSNull null];
+                    }
+                    [results addObject:info];
+                } @catch (NSException *innerEx) {
+                    DLog("BLUEBUBBLESHELPER: Error processing handle: %{public}@", innerEx);
+                }
+            }
+            if (transaction != nil) {
+                [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"data": results}];
+            }
+        } @catch (NSException *ex) {
+            DLog("BLUEBUBBLESHELPER: Error getting handles contact info: %{public}@", ex);
+            if (transaction != nil) {
+                [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"error": [ex reason] ?: @"Unknown error"}];
+            }
+        }
+    } else if ([event isEqualToString:@"get-contact-for-handle"]) {
+        @try {
+            NSString *address = data[@"address"];
+            IMHandle *handle = [[[IMAccountController sharedInstance] activeIMessageAccount] imHandleWithID:address];
+            if (handle == nil) {
+                handle = [[[IMAccountController sharedInstance] activeSMSAccount] imHandleWithID:address];
+            }
+            if (handle == nil) {
+                if (transaction != nil) {
+                    [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"error": @"Handle not found"}];
+                }
+                return;
+            }
+            IMPerson *person = [handle respondsToSelector:@selector(person)] ? [handle person] : nil;
+            NSMutableArray *allAddresses = [NSMutableArray array];
+            if (person != nil) {
+                if ([person respondsToSelector:@selector(phoneNumbers)]) {
+                    NSArray *phones = [person phoneNumbers];
+                    if (phones) [allAddresses addObjectsFromArray:phones];
+                }
+                if ([person respondsToSelector:@selector(allEmails)]) {
+                    NSArray *emails = [person allEmails];
+                    if (emails) [allAddresses addObjectsFromArray:emails];
+                }
+            }
+            NSDictionary *result = @{
+                @"fullName": [handle fullName] ?: [NSNull null],
+                @"firstName": (person && [person respondsToSelector:@selector(firstName)]) ? ([person firstName] ?: [NSNull null]) : [NSNull null],
+                @"lastName": (person && [person respondsToSelector:@selector(lastName)]) ? ([person lastName] ?: [NSNull null]) : [NSNull null],
+                @"nickname": (person && [person respondsToSelector:@selector(nickname)]) ? ([person nickname] ?: [NSNull null]) : [NSNull null],
+                @"isContact": @([handle isContact]),
+                @"isBusiness": @([handle respondsToSelector:@selector(isBusiness)] ? [handle isBusiness] : NO),
+                @"personCentricID": [handle personCentricID] ?: [NSNull null],
+                @"cnContactID": (person && [person respondsToSelector:@selector(cnContactID)]) ? ([person cnContactID] ?: [NSNull null]) : [NSNull null],
+                @"isInAddressBook": @(person != nil && [person respondsToSelector:@selector(isInAddressBook)] ? [person isInAddressBook] : NO),
+                @"allAddresses": allAddresses
+            };
+            if (transaction != nil) {
+                [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"data": result}];
+            }
+        } @catch (NSException *ex) {
+            DLog("BLUEBUBBLESHELPER: Error getting contact for handle: %{public}@", ex);
+            if (transaction != nil) {
+                [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"error": [ex reason] ?: @"Unknown error"}];
+            }
+        }
+    } else if ([event isEqualToString:@"get-contact-photo"]) {
+        @try {
+            NSString *address = data[@"address"];
+            NSString *quality = data[@"quality"] ?: @"full";
+            IMHandle *handle = [[[IMAccountController sharedInstance] activeIMessageAccount] imHandleWithID:address];
+            if (handle == nil) {
+                handle = [[[IMAccountController sharedInstance] activeSMSAccount] imHandleWithID:address];
+            }
+            NSData *photoData = nil;
+            if (handle != nil) {
+                if ([handle respondsToSelector:@selector(pictureData)]) {
+                    photoData = [handle pictureData];
+                }
+                if (photoData == nil && [handle respondsToSelector:@selector(customPictureData)]) {
+                    photoData = [handle customPictureData];
+                }
+                if (photoData == nil) {
+                    IMPerson *person = [handle respondsToSelector:@selector(person)] ? [handle person] : nil;
+                    if (person != nil && [person respondsToSelector:@selector(imageData)]) {
+                        photoData = [person imageData];
+                    }
+                }
+            }
+            id base64 = [NSNull null];
+            if (photoData != nil) {
+                if ([quality isEqualToString:@"thumbnail"]) {
+                    @try {
+                        NSImage *image = [[NSImage alloc] initWithData:photoData];
+                        if (image != nil) {
+                            NSSize thumbSize = NSMakeSize(150, 150);
+                            NSImage *thumbImage = [[NSImage alloc] initWithSize:thumbSize];
+                            [thumbImage lockFocus];
+                            [image drawInRect:NSMakeRect(0, 0, 150, 150) fromRect:NSMakeRect(0, 0, image.size.width, image.size.height) operation:NSCompositingOperationSourceOver fraction:1.0];
+                            [thumbImage unlockFocus];
+                            NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithData:[thumbImage TIFFRepresentation]];
+                            NSData *pngData = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+                            base64 = [pngData base64EncodedStringWithOptions:0];
+                        }
+                    } @catch (NSException *resizeEx) {
+                        DLog("BLUEBUBBLESHELPER: Error resizing photo: %{public}@", resizeEx);
+                        base64 = [photoData base64EncodedStringWithOptions:0];
+                    }
+                } else {
+                    base64 = [photoData base64EncodedStringWithOptions:0];
+                }
+            }
+            if (transaction != nil) {
+                [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"data": @{@"address": address, @"photoData": base64 ?: [NSNull null], @"quality": quality}}];
+            }
+        } @catch (NSException *ex) {
+            DLog("BLUEBUBBLESHELPER: Error getting contact photo: %{public}@", ex);
+            if (transaction != nil) {
+                [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"error": [ex reason] ?: @"Unknown error"}];
+            }
+        }
+    } else if ([event isEqualToString:@"batch-check-imessage"]) {
+        @try {
+            NSArray *addresses = data[@"addresses"];
+            if (addresses == nil || ![addresses isKindOfClass:[NSArray class]]) {
+                if (transaction != nil) {
+                    [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"error": @"addresses must be an array"}];
+                }
+                return;
+            }
+            NSMutableArray *destinations = [NSMutableArray array];
+            NSMutableArray *originalAddresses = [NSMutableArray array];
+            for (NSString *addr in addresses) {
+                @try {
+                    IDSDestination *dest = nil;
+                    // Simple heuristic: if contains @, treat as email; otherwise phone
+                    if ([addr containsString:@"@"]) {
+                        dest = IDSCopyIDForEmailAddress((__bridge CFStringRef)addr);
+                    } else {
+                        dest = IDSCopyIDForPhoneNumber((__bridge CFStringRef)addr);
+                    }
+                    if (dest != nil) {
+                        [destinations addObject:dest];
+                        [originalAddresses addObject:addr];
+                    }
+                } @catch (NSException *addrEx) {
+                    DLog("BLUEBUBBLESHELPER: Error creating destination for %{public}@: %{public}@", addr, addrEx);
+                }
+            }
+            NSString *txn = transaction;
+            [[IDSIDQueryController sharedInstance] currentIDStatusForDestinations:destinations service:IDSServiceNameiMessage listenerID:@"SOIDSListener-com.apple.imessage-rest" queue:dispatch_queue_create("BatchCheckIDS", NULL) completionBlock:^(NSDictionary *response) {
+                @try {
+                    NSMutableDictionary *statusMap = [NSMutableDictionary dictionary];
+                    // Map back to original addresses
+                    NSArray *keys = [response allKeys];
+                    for (NSUInteger i = 0; i < [keys count]; i++) {
+                        NSString *key = keys[i];
+                        NSNumber *status = response[key];
+                        // Try to find corresponding original address
+                        if (i < [originalAddresses count]) {
+                            statusMap[originalAddresses[i]] = status;
+                        } else {
+                            statusMap[key] = status;
+                        }
+                    }
+                    if (txn != nil) {
+                        [[NetworkController sharedInstance] sendMessage:@{@"transactionId": txn, @"data": statusMap}];
+                    }
+                } @catch (NSException *respEx) {
+                    DLog("BLUEBUBBLESHELPER: Error processing batch status response: %{public}@", respEx);
+                    if (txn != nil) {
+                        [[NetworkController sharedInstance] sendMessage:@{@"transactionId": txn, @"error": [respEx reason] ?: @"Unknown error"}];
+                    }
+                }
+            }];
+        } @catch (NSException *ex) {
+            DLog("BLUEBUBBLESHELPER: Error batch checking iMessage: %{public}@", ex);
+            if (transaction != nil) {
+                [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"error": [ex reason] ?: @"Unknown error"}];
+            }
+        }
+    } else if ([event isEqualToString:@"get-handle-siblings"]) {
+        @try {
+            NSString *address = data[@"address"];
+            IMHandle *handle = [[[IMAccountController sharedInstance] activeIMessageAccount] imHandleWithID:address];
+            if (handle == nil) {
+                handle = [[[IMAccountController sharedInstance] activeSMSAccount] imHandleWithID:address];
+            }
+            NSMutableArray *siblingList = [NSMutableArray array];
+            if (handle != nil && [handle respondsToSelector:@selector(siblingsArray)]) {
+                NSArray *siblings = [handle siblingsArray];
+                for (IMHandle *sibling in siblings) {
+                    [siblingList addObject:@{@"handleId": [sibling ID] ?: @"", @"service": [(id)[sibling service] name] ?: @""}];
+                }
+            }
+            NSDictionary *result = @{
+                @"personCentricID": (handle != nil) ? ([handle personCentricID] ?: [NSNull null]) : [NSNull null],
+                @"siblings": siblingList
+            };
+            if (transaction != nil) {
+                [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"data": result}];
+            }
+        } @catch (NSException *ex) {
+            DLog("BLUEBUBBLESHELPER: Error getting handle siblings: %{public}@", ex);
+            if (transaction != nil) {
+                [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"error": [ex reason] ?: @"Unknown error"}];
+            }
+        }
+    } else if ([event isEqualToString:@"get-suggested-names"]) {
+        @try {
+            NSString *filterAddress = data[@"address"];
+            NSArray *allHandles = [[IMHandleRegistrar sharedInstance] allIMHandles];
+            NSMutableArray *results = [NSMutableArray array];
+            for (IMHandle *handle in allHandles) {
+                @try {
+                    if (filterAddress != nil && filterAddress != (id)[NSNull null]) {
+                        if (![[handle ID] isEqualToString:filterAddress]) continue;
+                    }
+                    if ([handle respondsToSelector:@selector(hasSuggestedName)] && [handle hasSuggestedName]) {
+                        NSString *suggested = [handle respondsToSelector:@selector(suggestedName)] ? [handle suggestedName] : nil;
+                        if (suggested != nil) {
+                            [results addObject:@{@"handleId": [handle ID] ?: @"", @"suggestedName": suggested}];
+                        }
+                    }
+                } @catch (NSException *innerEx) {
+                    DLog("BLUEBUBBLESHELPER: Error checking suggested name: %{public}@", innerEx);
+                }
+            }
+            if (transaction != nil) {
+                [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"data": results}];
+            }
+        } @catch (NSException *ex) {
+            DLog("BLUEBUBBLESHELPER: Error getting suggested names: %{public}@", ex);
+            if (transaction != nil) {
+                [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"error": [ex reason] ?: @"Unknown error"}];
+            }
+        }
+    } else if ([event isEqualToString:@"get-contact-availability"]) {
+        @try {
+            NSString *address = data[@"address"];
+            IMHandle *handle = [[[IMAccountController sharedInstance] activeIMessageAccount] imHandleWithID:address];
+            if (handle == nil) {
+                handle = [[[IMAccountController sharedInstance] activeSMSAccount] imHandleWithID:address];
+            }
+            Class cls = NSClassFromString(@"IMHandleAvailabilityManager");
+            if (handle != nil && cls != nil) {
+                NSInteger status = (NSInteger)[[cls sharedInstance] availabilityForHandle:handle];
+                NSString *description = @"unknown";
+                if (status == 0) description = @"available";
+                else if (status == 1) description = @"idle";
+                else if (status == 2) description = @"do_not_disturb";
+                if (transaction != nil) {
+                    [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"data": @{@"availability": @(status), @"availabilityDescription": description}}];
+                }
+            } else {
+                if (transaction != nil) {
+                    [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"data": @{@"availability": @(-1), @"availabilityDescription": @"unavailable"}}];
+                }
+            }
+        } @catch (NSException *ex) {
+            DLog("BLUEBUBBLESHELPER: Error getting contact availability: %{public}@", ex);
+            if (transaction != nil) {
+                [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"error": [ex reason] ?: @"Unknown error"}];
+            }
+        }
+    } else if ([event isEqualToString:@"detect-business-contact"]) {
+        @try {
+            NSString *address = data[@"address"];
+            IMHandle *handle = [[[IMAccountController sharedInstance] activeIMessageAccount] imHandleWithID:address];
+            if (handle == nil) {
+                handle = [[[IMAccountController sharedInstance] activeSMSAccount] imHandleWithID:address];
+            }
+            BOOL isBiz = [handle respondsToSelector:@selector(isBusiness)] ? [handle isBusiness] : NO;
+            BOOL isMako = [handle respondsToSelector:@selector(isMako)] ? [handle isMako] : NO;
+            BOOL isApple = [handle respondsToSelector:@selector(isApple)] ? [handle isApple] : NO;
+            id bizName = [NSNull null];
+            if ([handle respondsToSelector:@selector(mapItem)]) {
+                id mapItem = [handle mapItem];
+                if (mapItem != nil && [mapItem respondsToSelector:@selector(name)]) {
+                    bizName = [mapItem name] ?: [NSNull null];
+                }
+            }
+            if (transaction != nil) {
+                [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"data": @{@"address": address ?: [NSNull null], @"isBusiness": @(isBiz), @"isMako": @(isMako), @"isApple": @(isApple), @"businessName": bizName ?: [NSNull null]}}];
+            }
+        } @catch (NSException *ex) {
+            DLog("BLUEBUBBLESHELPER: Error detecting business contact: %{public}@", ex);
+            if (transaction != nil) {
+                [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"error": [ex reason] ?: @"Unknown error"}];
+            }
         }
     } else if ([event isEqualToString:@"search-messages"]) {
         NSString* query = data[@"query"];
